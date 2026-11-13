@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -11,7 +13,12 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .config import Settings
-from .manager import JobManager, JobNotFoundError, LimitExceededError
+from .manager import (
+    JobManager,
+    JobNotFoundError,
+    LimitExceededError,
+    ServiceShuttingDownError,
+)
 from .netcdf_io import DatasetError
 
 logger = logging.getLogger("web")
@@ -111,6 +118,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             raise HTTPException(status_code=400, detail="uploaded file is empty")
         try:
             job = await manager.submit(filename, payload)
+        except ServiceShuttingDownError as exc:
+            # 503: the service is in its shutdown handoff and refuses new work.
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except LimitExceededError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except DatasetError as exc:
@@ -168,6 +178,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(DatasetError)
     async def dataset_error_handler(_request, exc: DatasetError) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+    # Controllable shutdown for demos and smoke tests on hosts where signals
+    # cannot be delivered to the service process (restricted seccomp).  Disabled
+    # unless ENABLE_SHUTDOWN_ENDPOINT=1 is set explicitly; in a normal container
+    # `docker compose stop` (SIGTERM) drives the same lifespan shutdown instead.
+    if os.getenv("ENABLE_SHUTDOWN_ENDPOINT", "").lower() in ("1", "true", "yes"):
+
+        @app.post("/admin/shutdown")
+        async def admin_shutdown() -> dict[str, str]:
+            async def _stop() -> None:
+                await manager.shutdown()
+                # Give in-flight polling requests a chance to observe the
+                # finalized states before the process leaves.
+                await asyncio.sleep(0.5)
+                # Flush uvicorn output, then leave the process so callers can
+                # observe the container/process actually terminating.
+                os._exit(0)
+
+            asyncio.create_task(_stop(), name="admin-shutdown")
+            return {"status": "shutdown initiated"}
 
     return app
 

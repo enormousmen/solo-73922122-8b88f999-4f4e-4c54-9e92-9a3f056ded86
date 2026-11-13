@@ -123,3 +123,51 @@ async def test_limit_returns_409(client: httpx.AsyncClient, target_file: Path):
             files={"file": ("t.nc", fh, "application/x-netcdf")},
         )
     assert r.status_code == 409
+
+
+async def test_submission_after_shutdown_returns_503(
+    settings: Settings, baseline_file: Path, target_file: Path, monkeypatch
+):
+    monkeypatch.setenv("ENABLE_SHUTDOWN_ENDPOINT", "1")
+    app = create_app(settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", timeout=30
+    ) as ac:
+        async with _lifespan(app):
+            with target_file.open("rb") as fh:
+                ok = await ac.post(
+                    "/api/jobs",
+                    files={"file": ("t.nc", fh, "application/x-netcdf")},
+                )
+            assert ok.status_code == 201
+
+            # Drive the manager shutdown directly (the HTTP endpoint would call
+            # os._exit, which cannot run inside the in-process ASGI test).
+            await app.state.manager.shutdown()
+
+            with target_file.open("rb") as fh:
+                refused = await ac.post(
+                    "/api/jobs",
+                    files={"file": ("t.nc", fh, "application/x-netcdf")},
+                )
+            assert refused.status_code == 503
+            assert "shutting down" in refused.json()["detail"]
+
+            # Read-only endpoints still answer during/after the handoff.
+            assert (await ac.get("/healthz")).status_code == 200
+            assert (await ac.get("/api/jobs")).status_code == 200
+
+
+async def test_shutdown_endpoint_disabled_by_default(
+    settings: Settings, baseline_file: Path
+):
+    app = create_app(settings)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test", timeout=30
+    ) as ac:
+        async with _lifespan(app):
+            r = await ac.post("/admin/shutdown")
+            assert r.status_code == 404
+        await app.state.manager.shutdown()

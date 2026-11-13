@@ -21,6 +21,17 @@ A job is only reported ``cancelled`` after its worker process (if any) has
 exited and been reaped and its files have been cleaned up.  Every phase
 handoff re-checks the flag under the lock, so a cancel racing with completion
 neither starts the anomaly phase nor publishes a late result.
+
+Shutdown handoff
+----------------
+:meth:`JobManager.shutdown` performs the same strict handoff semantics at
+service stop.  Once shutdown begins no new task is accepted, waiting tasks
+never launch a computation, and every process — including a worker created
+by a handoff that raced the shutdown — is terminated and reaped before the
+call returns.  Unfinished jobs never publish results and their directories
+are removed; results completed before the shutdown are kept.  The full
+teardown runs to completion even if the awaiting coroutine is cancelled, and
+concurrent or repeated shutdown calls share one idempotent teardown.
 """
 
 from __future__ import annotations
@@ -96,6 +107,10 @@ class LimitExceededError(RuntimeError):
     pass
 
 
+class ServiceShuttingDownError(RuntimeError):
+    """Raised when a new task is submitted after shutdown has begun."""
+
+
 class JobNotFoundError(KeyError):
     pass
 
@@ -108,6 +123,9 @@ class JobManager:
         self._baseline_run: BaselineRun | None = None
         self._baseline_grid: GridSignature | None = None
         self._shutdown = False
+        # Single coalesced teardown: every (concurrent or repeated) shutdown
+        # call awaits the same task, so repeated calls behave like one finish.
+        self._shutdown_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ setup
     async def startup(self) -> None:
@@ -130,42 +148,190 @@ class JobManager:
         )
 
     async def shutdown(self) -> None:
+        """Stop accepting work and finish the whole shutdown handoff.
+
+        Semantics:
+
+        * after the first call, new submissions are refused;
+        * waiting jobs never launch their anomaly worker, and every worker
+          (baseline or anomaly, including one started by a handoff racing the
+          shutdown) is terminated and reaped before this returns;
+        * every background supervisor is awaited to completion;
+        * unfinished jobs publish nothing and their directories are removed,
+          while jobs already ``done`` keep their results;
+        * repeated/concurrent calls share one idempotent teardown;
+        * if the caller is cancelled while awaiting, the reaping still runs to
+          completion and only then the cancellation is re-raised.
+        """
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                self._shutdown_once(), name="manager-shutdown"
+            )
+        await self._await_teardown(self._shutdown_task)
+
+    async def _await_teardown(self, task: asyncio.Task) -> None:
+        # Shield the actual teardown from the caller's cancellation: the work
+        # continues to completion no matter what happens to this await, and
+        # the cancellation is only propagated afterwards.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                LOG.warning(
+                    "shutdown await cancelled; teardown continues to completion"
+                )
+                # Keep this coroutine cancelled for the caller while the
+                # shielded teardown finishes the reaping.
+                await asyncio.shield(task)
+                raise
+
+    async def _shutdown_once(self) -> None:
+        # Phase 1: under the lock, flip the closed flag, snapshot the work and
+        # mark every unfinished job.  From this instant on no handoff may start
+        # another computation, and new submissions are refused.
         async with self._lock:
             self._shutdown = True
             jobs = list(self._jobs.values())
             run = self._baseline_run
+            procs: list[tuple[asyncio.subprocess.Process, Path | None, str]] = []
+            for job in jobs:
+                if not job.terminal:
+                    job.message = "service shutting down; task will be reclaimed"
+                    job.updated_at = _utcnow()
+                if job.proc is not None and job.proc.returncode is None:
+                    procs.append((job.proc, job.cancel_file, job.id[:8]))
+            if run is not None:
+                if run.status in (
+                    BaselineStatus.STARTING,
+                    BaselineStatus.RUNNING,
+                ):
+                    # Stop a queued baseline from ever spawning and make a
+                    # running one drain without publishing.
+                    run.status = BaselineStatus.DRAINING
+                    run.message = "service shutting down; shared run draining"
+                    run.event.set()
+                if run.proc is not None and run.proc.returncode is None:
+                    procs.append((run.proc, run.cancel_file, run.id[:8]))
 
+        # Phase 2: terminate every process known at handoff.  The cooperative
+        # cancel file covers hosts whose seccomp policy refuses kill(2).
         terminators = [
-            self._terminate(job.proc, job.cancel_file, job.id[:8])
-            for job in jobs
-            if job.proc is not None and job.proc.returncode is None
-        ]
-        if (
-            run is not None
-            and run.proc is not None
-            and run.proc.returncode is None
-        ):
-            terminators.append(
-                self._terminate(run.proc, run.cancel_file, run.id[:8])
+            asyncio.create_task(
+                self._terminate(proc, cancel_file, label),
+                name=f"shutdown-kill-{label}",
             )
+            for proc, cancel_file, label in procs
+        ]
         if terminators:
             await asyncio.gather(*terminators, return_exceptions=True)
 
-        # Let supervisors run their reaping/cleanup to completion within a
-        # bounded window rather than abandoning them mid-handoff.
+        # Phase 3: let every supervisor perform its own reaping and cleanup.
+        # Shielded so a supervisor can never be abandoned mid-handoff.
         supervisors = [
             job.supervisor for job in jobs if job.supervisor is not None
         ]
         if run is not None and run.supervisor is not None:
             supervisors.append(run.supervisor)
         if supervisors:
-            await asyncio.wait(
-                [asyncio.shield(t) for t in supervisors],
-                timeout=self.settings.worker_term_timeout + 2.0,
+            await asyncio.gather(
+                *(asyncio.shield(t) for t in supervisors),
+                return_exceptions=True,
             )
-        for task in supervisors:
-            if not task.done():
-                task.cancel()
+
+        # Phase 4: defense in depth.  A process created by a handoff racing
+        # phase 1 (e.g. an anomaly worker spawned between the baseline event
+        # and the closed-flag check) must also be stopped and reaped.  Re-scan
+        # under the lock until no live process remains anywhere.
+        while True:
+            async with self._lock:
+                late: list[
+                    tuple[asyncio.subprocess.Process, Path | None, str]
+                ] = []
+                for job in self._jobs.values():
+                    if (
+                        job.proc is not None
+                        and job.proc.returncode is None
+                    ):
+                        late.append(
+                            (job.proc, job.cancel_file, job.id[:8])
+                        )
+                current_run = self._baseline_run
+                if (
+                    current_run is not None
+                    and current_run.proc is not None
+                    and current_run.proc.returncode is None
+                ):
+                    late.append(
+                        (
+                            current_run.proc,
+                            current_run.cancel_file,
+                            current_run.id[:8],
+                        )
+                    )
+            if not late:
+                break
+            LOG.warning(
+                "shutdown reaping %d late-created worker process(es)",
+                len(late),
+            )
+            await asyncio.gather(
+                *(
+                    asyncio.create_task(
+                        self._terminate(proc, cancel_file, label)
+                    )
+                    for proc, cancel_file, label in late
+                ),
+                return_exceptions=True,
+            )
+            async with self._lock:
+                late_sups = [
+                    job.supervisor
+                    for job in self._jobs.values()
+                    if job.supervisor is not None and not job.supervisor.done()
+                ]
+                current_run = self._baseline_run
+                if (
+                    current_run is not None
+                    and current_run.supervisor is not None
+                    and not current_run.supervisor.done()
+                ):
+                    late_sups.append(current_run.supervisor)
+            if late_sups:
+                await asyncio.gather(
+                    *(asyncio.shield(t) for t in late_sups),
+                    return_exceptions=True,
+                )
+
+        # Phase 5: deterministic final bookkeeping.  Unfinished jobs publish
+        # nothing: their (possibly partial) directories are removed and they
+        # are reported cancelled.  Jobs already done keep their results; the
+        # published climatology is likewise preserved, while unpublished
+        # baseline artifacts are removed.
+        async with self._lock:
+            for job in self._jobs.values():
+                if job.state is JobState.DONE:
+                    # Result completed before the shutdown: keep it.
+                    continue
+                if job.proc is not None and job.proc.returncode is None:
+                    # Unreachable after phase 4, but never leave ambiguity.
+                    LOG.error(
+                        "job %s still had a live worker at finalize", job.id
+                    )
+                if not job.terminal:
+                    job.state = JobState.CANCELLED
+                    job.message = "cancelled by service shutdown"
+                    job.updated_at = _utcnow()
+                shutil.rmtree(job.target_path.parent, ignore_errors=True)
+
+            current_run = self._baseline_run
+            if current_run is not None:
+                if not self.baseline_climatology_ready():
+                    current_run.part_path.unlink(missing_ok=True)
+                    current_run.cancel_file.unlink(missing_ok=True)
+                self._safe_close(current_run.log_handle)
+            LOG.info("shutdown handoff complete; all workers and supervisors ended")
 
     def _clean_stale_jobs(self) -> None:
         jobs_dir = self.settings.jobs_dir
@@ -213,7 +379,9 @@ class JobManager:
     async def submit(self, filename: str, payload: bytes) -> JobRecord:
         async with self._lock:
             if self._shutdown:
-                raise RuntimeError("service is shutting down")
+                raise ServiceShuttingDownError(
+                    "service is shutting down; new tasks are not accepted"
+                )
             active = sum(1 for job in self._jobs.values() if job.active)
             if active >= self.settings.max_active_jobs:
                 raise LimitExceededError(
@@ -370,17 +538,23 @@ class JobManager:
             if not ready:
                 return  # baseline failure or cancellation finalized the job
 
-            # Handoff gate #1: baseline -> anomaly.
+            # Handoff gate #1: baseline -> anomaly.  Never start the anomaly
+            # computation once shutdown has begun, even if the shared baseline
+            # just completed.
             proc = await self._launch_anomaly(job)
             if proc is None:
-                return  # cancelled while acquiring the lock
+                return  # cancelled / shutting down while acquiring the lock
 
             rc = await proc.wait()
 
-            # Handoff gate #2: worker exit -> result publication.
+            # Handoff gate #2: worker exit -> result publication.  A result is
+            # only published when the job is still live and the service is not
+            # shutting down; otherwise the worker output is discarded.
             async with self._lock:
-                if job.state == JobState.CANCELLING:
-                    self._finalize_cancel_locked(job)
+                if self._shutdown or job.state == JobState.CANCELLING:
+                    self._remove_partial(job.output_path)
+                    if not job.terminal:
+                        self._finalize_cancel_locked(job)
                     return
                 if rc == 0 and job.output_path.is_file():
                     job.state = JobState.DONE
@@ -398,6 +572,10 @@ class JobManager:
         except Exception as exc:  # noqa: BLE001
             LOG.exception("supervisor error for %s", job_id)
             async with self._lock:
+                if self._shutdown:
+                    # Phase 5 finalizes the job and removes its directory.
+                    self._remove_partial(job.output_path)
+                    return
                 if not job.terminal:
                     job.state = JobState.ERROR
                     job.message = f"internal error: {exc}"
@@ -417,6 +595,11 @@ class JobManager:
         attached_run: BaselineRun | None = None
         while True:
             async with self._lock:
+                if self._shutdown:
+                    # Shutdown began while the job was waiting: it must never
+                    # attach to or spawn another computation.  Phase 5 of the
+                    # shutdown performs the final state/cleanup bookkeeping.
+                    return False
                 if job.state in (
                     JobState.CANCELLING,
                     JobState.CANCELLED,
@@ -457,7 +640,7 @@ class JobManager:
             await event.wait()
 
             async with self._lock:
-                if job.terminal:
+                if self._shutdown or job.terminal:
                     return False
                 if job.state == JobState.CANCELLING:
                     # The last-waiter drain woke us; honor cancellation rather
@@ -499,6 +682,11 @@ class JobManager:
         self, job: JobRecord
     ) -> asyncio.subprocess.Process | None:
         async with self._lock:
+            if self._shutdown:
+                # The baseline finished as shutdown began: do not start the
+                # anomaly phase.  Shutdown phase 5 finalizes and cleans up.
+                LOG.info("suppressing anomaly launch for %s: shutting down", job.id)
+                return None
             if job.state == JobState.CANCELLING or job.state == JobState.CANCELLED:
                 if not job.terminal:
                     self._finalize_cancel_locked(job)

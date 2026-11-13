@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 import xarray as xr
 
-from app.manager import JobManager, LimitExceededError
+from app.manager import JobManager, LimitExceededError, ServiceShuttingDownError
 from app.models import BaselineStatus, JobState
 from app.netcdf_io import DatasetError
 from tests.conftest import wait_until
@@ -338,3 +339,243 @@ async def test_shutdown_terminates_all_workers(
     assert base_proc.returncode is not None
     for job in (a, b):
         assert job.proc is None or job.proc.returncode is not None
+
+
+# ---------------------------------------------------------------- shutdown
+async def test_shutdown_rejects_new_submissions(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    await manager.shutdown()
+    with pytest.raises(ServiceShuttingDownError):
+        await _submit(manager, target_file, "late.nc")
+    # Nothing was created for the refused submission.
+    assert manager._jobs == {}
+    assert not any(settings.jobs_dir.iterdir())
+
+
+async def test_shutdown_is_idempotent_and_coalesced(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    a = await _submit(manager, target_file, "a.nc")
+    b = await _submit(manager, target_file, "b.nc")
+    await wait_until(
+        lambda: manager._baseline_run is not None
+        and manager._baseline_run.proc is not None,
+        timeout=10,
+    )
+    base_proc = manager._baseline_run.proc
+
+    # Concurrent and repeated shutdown calls share one teardown.
+    results = await asyncio.gather(
+        manager.shutdown(), manager.shutdown(), return_exceptions=True
+    )
+    assert results == [None, None]
+    await manager.shutdown()  # again, after completion
+    assert manager._shutdown_task is not None
+    assert manager._shutdown_task.done()
+    assert base_proc.returncode is not None
+    for job in (a, b):
+        assert job.state is JobState.CANCELLED
+        assert not job.target_path.parent.exists()
+
+
+async def test_shutdown_cancelled_await_still_reaps_everything(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    a = await _submit(manager, target_file, "a.nc")
+    await wait_until(
+        lambda: manager._baseline_run is not None
+        and manager._baseline_run.proc is not None,
+        timeout=10,
+    )
+    base_proc = manager._baseline_run.proc
+
+    outer = asyncio.create_task(manager.shutdown())
+    # Cancel the awaiting task while the teardown is in flight.
+    await asyncio.sleep(0)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    # The shielded teardown must still run to completion: no live process,
+    # no unfinished job, no leftover directory.
+    await wait_until(lambda: manager._shutdown_task.done(), timeout=15)
+    assert base_proc.returncode is not None
+    assert a.state is JobState.CANCELLED
+    assert not a.target_path.parent.exists()
+    # And a later, uncancelled shutdown call returns cleanly (same finish).
+    await manager.shutdown()
+
+
+async def test_shutdown_during_running_anomaly_reaps_worker_and_publishes_nothing(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    seed = await _submit(manager, target_file, "seed.nc")
+    await wait_until(lambda: seed.state is JobState.DONE, timeout=40)
+
+    job = await _submit(manager, target_file, "anom.nc")
+    await wait_until(lambda: job.proc is not None, timeout=15)
+    proc = job.proc
+    assert proc.returncode is None
+
+    await manager.shutdown()
+    assert proc.returncode is not None  # actually reaped
+    assert job.state is JobState.CANCELLED
+    assert not job.output_path.exists()
+    assert not job.target_path.parent.exists()
+    # The already completed job keeps its result on disk.
+    assert seed.state is JobState.DONE
+    assert seed.output_path.is_file()
+
+
+async def test_shutdown_racing_baseline_completion_never_starts_anomaly(
+    settings, baseline_file, target_file, monkeypatch
+):
+    manager = await _start(settings)
+    job = await _submit(manager, target_file, "race.nc")
+    launch_called = asyncio.Event()
+    original_launch = manager._launch_anomaly
+
+    async def _guarded_launch(record):
+        # Simulate the exact handoff described in the incident: the shared
+        # baseline has just completed and the job is about to start its
+        # anomaly worker when the shutdown begins.
+        launch_called.set()
+        await asyncio.sleep(0.05)
+        return await original_launch(record)
+
+    monkeypatch.setattr(manager, "_launch_anomaly", _guarded_launch)
+
+    await wait_until(launch_called.wait, timeout=20)
+    await manager.shutdown()
+
+    assert job.state is JobState.CANCELLED
+    assert job.proc is None  # the anomaly process was never started
+    assert not job.output_path.exists()
+    assert not job.target_path.parent.exists()
+
+
+async def test_late_created_anomaly_process_is_stopped_and_reaped(
+    settings, baseline_file, target_file, monkeypatch
+):
+    # Reproduce the incident deterministically: the anomaly process is created
+    # by the baseline->anomaly handoff while the shutdown flag is being set,
+    # so it is absent from phase-1's snapshot.  The phase-4 rescan must still
+    # terminate and reap it.
+    manager = await _start(settings)
+    seed = await _submit(manager, target_file, "seed.nc")
+    await wait_until(lambda: seed.state is JobState.DONE, timeout=40)
+
+    job = await _submit(manager, target_file, "late-spawn.nc")
+    await wait_until(lambda: job.proc is not None, timeout=15)
+    hidden_proc = job.proc
+
+    real_terminate = manager._terminate
+    phase_two_seen = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _hide_from_phase_two(proc, cancel_file, label):
+        # The first terminate attempt for this process is a no-op that only
+        # unblocks the test, emulating a process missing from the phase-1
+        # snapshot.  A later (phase-4) attempt performs the real reaping.
+        if proc is hidden_proc and not phase_two_seen.is_set():
+            phase_two_seen.set()
+            await release.wait()
+            return None
+        return await real_terminate(proc, cancel_file, label)
+
+    monkeypatch.setattr(manager, "_terminate", _hide_from_phase_two)
+    shutdown_task = asyncio.create_task(manager.shutdown())
+
+    # Phase 2 "misses" the hidden process and parks on the release gate, which
+    # also keeps its supervisor blocked inside the phase-3 gather.
+    await wait_until(phase_two_seen.wait, timeout=10)
+    assert hidden_proc.returncode is None
+    release.set()  # let teardown proceed into the phase-4 rescan
+
+    await shutdown_task
+    assert hidden_proc.returncode is not None
+    assert job.proc.returncode is not None
+    assert job.state is JobState.CANCELLED
+    assert not job.target_path.parent.exists()
+
+
+async def test_done_result_survives_shutdown_and_unfinished_dirs_removed(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    done_job = await _submit(manager, target_file, "done.nc")
+    await wait_until(lambda: done_job.state is JobState.DONE, timeout=40)
+
+    # A second, still-unfinished job when shutdown arrives.
+    running = await _submit(manager, target_file, "running.nc")
+    await wait_until(lambda: running.proc is not None, timeout=15)
+    proc = running.proc
+
+    await manager.shutdown()
+
+    assert done_job.state is JobState.DONE
+    assert done_job.output_path.is_file()  # pre-shutdown success retained
+    assert running.state is JobState.CANCELLED
+    assert proc.returncode is not None
+    assert not running.target_path.parent.exists()
+    # Only the finished job's directory remains under jobs/.
+    remaining = [p for p in settings.jobs_dir.iterdir() if p.is_dir()]
+    assert remaining == [done_job.target_path.parent]
+
+
+async def test_cancel_request_racing_shutdown_is_harmless(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    a = await _submit(manager, target_file, "a.nc")
+    b = await _submit(manager, target_file, "b.nc")
+    await wait_until(
+        lambda: manager._baseline_run is not None
+        and manager._baseline_run.proc is not None,
+        timeout=10,
+    )
+    base_proc = manager._baseline_run.proc
+
+    # A user cancel racing the shutdown must not corrupt the teardown.
+    shutdown_task = asyncio.create_task(manager.shutdown())
+    cancel_result = await manager.cancel(a.id)
+    await shutdown_task
+
+    assert cancel_result.state in (
+        JobState.CANCELLING,
+        JobState.CANCELLED,
+    )
+    assert a.state is JobState.CANCELLED
+    assert b.state is JobState.CANCELLED
+    assert base_proc.returncode is not None
+    assert not a.target_path.parent.exists()
+    assert not b.target_path.parent.exists()
+
+
+async def test_restart_cleans_leftover_job_dirs_with_original_rule(
+    settings, baseline_file, target_file
+):
+    manager = await _start(settings)
+    job = await _submit(manager, target_file, "a.nc")
+    await wait_until(lambda: job.state is JobState.DONE, timeout=40)
+    leftover = settings.jobs_dir / "orphan"
+    leftover.mkdir()
+    (leftover / "partial.nc.part").write_bytes(b"x")
+
+    # A brand-new manager over the same data dir applies the original
+    # startup rule: wipe the whole jobs directory.
+    manager_two = JobManager(settings)
+    await manager_two.startup()
+    try:
+        assert not settings.jobs_dir.exists() or not any(
+            settings.jobs_dir.iterdir()
+        )
+        # The published climatology is untouched by startup cleanup.
+        assert settings.baseline_work_path.is_file()
+    finally:
+        await manager_two.shutdown()

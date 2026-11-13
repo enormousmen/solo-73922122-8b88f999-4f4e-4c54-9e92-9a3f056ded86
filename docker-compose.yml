@@ -12,6 +12,11 @@ services:
       SLOW_STEPS: "12"
       MAX_ACTIVE_JOBS: "2"
       WORKER_TERM_TIMEOUT: "8"
+      # Expose the in-process shutdown trigger for the controllable shutdown
+      # demo (POST /admin/shutdown).  `docker compose stop` (SIGTERM) runs the
+      # exact same lifespan teardown; the endpoint only helps on hosts whose
+      # seccomp policy refuses signal delivery.
+      ENABLE_SHUTDOWN_ENDPOINT: "1"
     volumes:
       - tas-data:/data
     healthcheck:

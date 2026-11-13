@@ -22,6 +22,14 @@
 | 取消一份不影响其余 | 仅从等待者集合移除；仍有等待者时共享进程不终止 |
 | 最后等待者取消须终止并回收 | 共享进程进入 `draining`，终止实际计算、回收进程、删除临时/成品文件，运行标记 `terminated` |
 | 收尾中新任务不得加入旧计算 | 仅 `starting/running` 可挂接；`draining/terminated/error/done` 一律不挂接，新任务另起新运行 |
+| 停机交接：开始关闭即拒绝新任务 | `JobManager.shutdown()` 先在锁内置位关闭标志，此后 `POST /api/jobs` 返回 **503**，等待中的任务不再启动任何计算 |
+| 迟到创建的进程也须停止回收 | 关闭流程第 4 阶段在锁内反复扫描全部任务与基准运行，直到不存在任何存活子进程；交接竞态中刚创建的距平进程同样被终止并 reap |
+| 未完成任务不得发布结果 | 子进程退出→发布的交接闸门复查关闭标志；未完成任务的输出/`.part` 与任务目录一律删除，终态记为 `cancelled` |
+| 等基准、距平进程与后台监督全部结束再返回 | 关闭流程依次：终止已知进程 → shield 等待全部 supervisor 完成自身回收 → 补扫迟到进程 → 终态定稿与目录清理，然后才返回 |
+| 重复/并发关闭等同一次收尾 | 所有关闭调用共享同一个 teardown 任务，重复调用幂等 |
+| 关闭等待被取消也须完成回收 | teardown 以 `asyncio.shield` 运行；调用方协程被取消时回收仍跑到底，随后才向上传播 `CancelledError` |
+| 关闭前已成功的结果保留 | `done` 任务的 `anomaly.nc` 与已发布的气候态在关闭中保留；仅未完成任务目录被清理 |
+| 重启清理沿用原规则 | 下次启动 `_clean_stale_jobs()` 仍清空整个 `jobs/` 目录，逻辑未改 |
 | 距平在独立进程计算 | `python -I -m app.worker` 子进程，与 Web 进程隔离 |
 | 取消与阶段交接/完成交错不启动后续阶段、不发布迟到结果 | 子进程在每个切片与**每个阶段边界**检查取消标志；发布前再检查一次；取消时删除任何 `.part`/成品并以 143 退出 |
 | 退出并清理后才报已取消 | 管理器等待子进程退出（reap）并删除任务目录后，才把状态置为 `cancelled` |
@@ -133,6 +141,52 @@ curl -X POST http://localhost:8000/api/jobs/<id>/cancel
 curl -OJ http://localhost:8000/api/jobs/<id>/download
 ```
 
+### 5.1 停机交接的可控演示
+
+网页「① 历史基准状态」面板提供 **触发停机交接** 按钮（compose 已启用
+`ENABLE_SHUTDOWN_ENDPOINT=1`）；命令行两种触发方式等价：
+
+```bash
+curl -X POST http://localhost:8000/admin/shutdown     # 受限 seccomp / 浏览器演示
+docker compose stop web                               # 常规容器：SIGTERM 走同一逻辑
+```
+
+**场景 A：基准完成与停机交错**
+
+1. 连续上传两份任务，等共享基准进入 `running`。
+2. 在基准即将完成时触发停机：等待中的任务**不会**再启动距平进程，
+   新上传请求收到 **503**；基准进程被终止回收，两份任务终态 `cancelled`、目录删除。
+
+**场景 B：距平运行中停机**
+
+1. 先跑一份任务直到 `done`（发布共享气候态），再上传第二份，等其距平子进程 `running`。
+2. 触发停机：距平进程被终止并 reap，任务记为 `cancelled`，下载返回 409/连接拒绝，
+   不发布任何迟到结果；第一份 `done` 任务的 `anomaly.nc` 保留。
+
+**一键脚本演示（真实 uvicorn 子进程 + HTTP API + 进程残留校验）：**
+
+```bash
+python -I -m scripts.demo_shutdown             # 三幕全部执行
+python -I -m scripts.demo_shutdown --acts 1,2  # 仅前两幕
+```
+
+脚本自动探测环境是否允许 `kill(2)`：允许则用 SIGTERM（与 `docker compose stop`
+一致），否则走 `/admin/shutdown`；每一幕都断言服务进程退出且停机前存活的
+worker PID 全部消失。
+
+### 5.2 `JobManager.shutdown()` 的五个阶段
+
+| 阶段 | 动作 |
+| --- | --- |
+| 1 关闭置位 | 锁内置 `_shutdown`、快照任务与基准运行；排队基准转 `draining` 并唤醒等待者。此后提交抛 `ServiceShuttingDownError`（HTTP 503），任何交接闸门都不再启动新进程 |
+| 2 终止已知进程 | 对快照中的基准/距平进程发起终止（SIGTERM，受限环境回落取消文件，超时升级 SIGKILL）并 reap |
+| 3 等待后台监督 | shield 等待全部 job/baseline supervisor 完成各自的回收与清理，绝不中途丢弃 |
+| 4 迟到进程补扫 | 锁内循环重扫，直到不存在任何存活子进程；交接竞态中迟到创建的距平进程同样被终止 reap，并再次等待其 supervisor 收尾 |
+| 5 定稿与清理 | 未完成任务统一记 `cancelled` 并删除任务目录（不发布结果）；`done` 任务与已发布气候态保留，未发布的基准 `.part`/取消文件清除 |
+
+重复或并发调用共享同一个 teardown 任务（幂等）；等待关闭的协程即使被取消，
+shield 内的回收仍执行到底，再向上传播 `CancelledError`。
+
 ---
 
 ## 6. HTTP API
@@ -144,11 +198,12 @@ curl -OJ http://localhost:8000/api/jobs/<id>/download
 | GET | `/api/baseline` | 固定基准信息、网格、当前共享运行与等待者 |
 | GET | `/api/samples` | 可下载样例列表 |
 | GET | `/samples/{name}` | 下载样例 NetCDF |
-| POST | `/api/jobs` | multipart 上传字段 `file`，201 受理；400 校验失败；409 超并发 |
+| POST | `/api/jobs` | multipart 上传字段 `file`，201 受理；400 校验失败；409 超并发；停机后 **503** |
 | GET | `/api/jobs` | 全部任务与活跃计数 |
 | GET | `/api/jobs/{id}` | 单任务状态 |
 | POST | `/api/jobs/{id}/cancel` | 请求取消（终态任务幂等） |
 | GET | `/api/jobs/{id}/download` | 下载距平 NetCDF（非 done 返回 409） |
+| POST | `/admin/shutdown` | 可控停机演示，需 `ENABLE_SHUTDOWN_ENDPOINT=1`，未启用返回 404。生产路径用 `docker compose stop` 的 SIGTERM，二者走同一份 lifespan 停机逻辑 |
 
 任务状态：`queued / running / cancelling / done / error / cancelled`。
 
@@ -164,6 +219,7 @@ curl -OJ http://localhost:8000/api/jobs/<id>/download
 | `SLOW_STEPS` | `12` | 慢切片数量（乘积为总人造延迟） |
 | `WORKER_TERM_TIMEOUT` | `8` | 优雅退出等待秒数，超时升级 SIGKILL |
 | `POLL_INTERVAL` | `0.15` | 内部轮询间隔 |
+| `ENABLE_SHUTDOWN_ENDPOINT` | 未设置 | 置 `1/true/yes` 时开放 `POST /admin/shutdown`，供禁信号环境与浏览器演示触发停机 |
 
 ---
 
@@ -174,15 +230,18 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-39 个测试覆盖：
+49 个测试覆盖：
 
 - 数据契约校验（重复时间、非月初、非公历日历、非开尔文、网格不一致、维度顺序、额外变量、非单调坐标、整型 tas、损坏文件）；
 - 气候态忽略缺测、距平数值、无基准月→NaN、坐标逐字保留；
 - 子进程 CLI 正常路径、SIGTERM/取消文件两条取消通道、启动窗口取消、无残留文件；
 - 管理器：端到端、两份共享一个基准进程、409 上限、取消单个不影响其余、
   最后等待者取消终止回收且新任务不加入旧运行、距平阶段取消回收、
-  完成与取消交错不发布迟到结果、基准失败报错、关闭时回收全部进程；
-- HTTP 层完整上传/状态/取消/下载流程。
+  完成与取消交错不发布迟到结果、基准失败报错；
+- **停机交接**：关闭后拒绝新提交（503）、重复/并发关闭幂等、等待被取消仍完成回收、
+  距平运行中停机不发布结果、基准完成×停机交错不启动距平、迟到创建的进程被补扫回收、
+  已完成结果保留而未完成目录删除、重启沿用原清理规则；
+- HTTP 层完整上传/状态/取消/下载流程与停机 503、停机端点开关。
 
 > 注：本开发沙箱的 seccomp 禁止 `kill(2)`，信号相关用例自动改走取消文件通道；
 > 在普通 Docker 容器内则走真实 SIGTERM，两条路径均在 CI 风格的测试中验证。
@@ -198,11 +257,12 @@ app/
   netcdf_io.py         NetCDF 校验与网格签名
   compute.py           气候态/距平计算、可中断慢计算、虚构样例生成
   worker.py            独立进程工作器 CLI（信号 + 取消文件）
-  manager.py           任务/基准生命周期、并发上限、共享与取消语义
-  main.py              FastAPI 路由
-  templates/index.html 演示网页
+  manager.py           任务/基准生命周期、并发上限、共享、取消与停机交接语义
+  main.py              FastAPI 路由（含受控 /admin/shutdown）
+  templates/index.html 演示网页（上传/查询/取消/下载/停机按钮）
 scripts/
   generate_samples.py  生成虚构基准与样例
+  demo_shutdown.py     停机交接三幕可控演示（真实 uvicorn + HTTP + 进程残留校验）
 docker/
   entrypoint.sh        容器入口（按需生成样例后启动服务）
 tests/                 pytest 测试

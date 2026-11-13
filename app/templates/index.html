@@ -75,6 +75,10 @@
   <section class="panel">
     <h2>① 历史基准状态</h2>
     <div class="kv" id="baseline"><div class="k">加载中…</div><div></div></div>
+    <p class="hint" style="margin-bottom:0">
+      停机演示：开始关闭后新任务返回 503；等待中的任务不再启动距平，所有子进程终止回收后进程退出。
+      <button type="button" id="shutdown-btn" style="margin-left:8px">触发停机交接（/admin/shutdown）</button>
+    </p>
   </section>
 
   <section class="panel">
@@ -184,6 +188,22 @@ window.cancelJob = async function (id) {
   } catch (e) { flash(e.message, false); }
   refreshJobs();
 };
+
+$("#shutdown-btn").addEventListener("click", async () => {
+  if (!confirm("确认开始停机交接？未完成任务将被回收，完成结果保留，随后进程退出。")) return;
+  try {
+    const r = await fetch("/admin/shutdown", { method: "POST" });
+    if (r.status === 404) {
+      flash("未启用 ENABLE_SHUTDOWN_ENDPOINT；请用 docker compose stop / SIGTERM 触发同一停机逻辑", false);
+      return;
+    }
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    flash("停机交接已开始：拒绝新任务、回收全部子进程，随后服务进程退出", true);
+    $("#shutdown-btn").disabled = true;
+  } catch (e) {
+    flash("触发停机失败：" + e.message, false);
+  }
+});
 
 $("#upload-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
